@@ -8,11 +8,8 @@
 #include <QDebug>
 #include <QElapsedTimer>
 #include <QCoreApplication>
+#include <cstdlib> // 引入 system()
 
-// ==========================================================
-// 针对 Linux 环境引入 SocketCAN 头文件
-// 使用宏隔离，保证在 Windows/MinGW 下代码依然能正常编译运行 UI
-// ==========================================================
 #ifdef Q_OS_LINUX
 #include <sys/socket.h>
 #include <sys/ioctl.h>
@@ -28,15 +25,15 @@
 // ==========================================================
 const int BOARD_DO_PINS[4] = {21, 6, 22, 144};
 const int BOARD_DI_PINS[4] = {91, 120, 89, 88};
+const int DEFAULT_CAN_BITRATE = 500000; // 默认 CAN 波特率 500k
 // ==========================================================
 
 GpioTestWindow::GpioTestWindow(QWidget *parent)
     : QWidget(parent)
 {
     setupUi();
-    setWindowTitle("东莞市拓朗工控设备有限公司 GPIO与CAN测试程序");
+    setWindowTitle("GPIO与CAN测试程序");
 
-    // 根据探测到的 CAN 数量动态调整窗口高度
     int windowHeight = 250 + (canElements.size() * 40);
     resize(700, windowHeight);
 
@@ -49,7 +46,6 @@ GpioTestWindow::~GpioTestWindow()
 {
 }
 
-// 自动探测 Linux 系统下 `/sys/class/net/` 目录中的 can 设备
 QStringList GpioTestWindow::getAvailableCanInterfaces()
 {
     QStringList canList;
@@ -57,15 +53,35 @@ QStringList GpioTestWindow::getAvailableCanInterfaces()
     QDir netDir("/sys/class/net");
     if (netDir.exists()) {
         QStringList filters;
-        filters << "can*"; // 过滤以 can 开头的文件夹 (如 can0, can1)
+        filters << "can*";
         canList = netDir.entryList(filters, QDir::Dirs | QDir::NoDotAndDotDot);
         canList.sort();
     }
 #else
-    // 如果在 Windows 下开发测试，模拟出两个 CAN 接口方便调试 UI
-    canList << "can0" << "can1";
+    canList << "can0" << "can1"; // Windows 模拟
 #endif
     return canList;
+}
+
+// ==========================================================
+// 新增：自动执行 Linux 终端命令，配置 CAN 节点
+// (注意：程序需要在 Linux 下以 root 权限运行，这在工控机上通常是默认的)
+// ==========================================================
+void GpioTestWindow::autoConfigCanInterface(const QString &ifaceName, int bitrate)
+{
+#ifdef Q_OS_LINUX
+    // 拼接命令
+    QString downCmd = QString("ip link set down %1").arg(ifaceName);
+    QString cfgCmd  = QString("ip link set %1 type can bitrate %2").arg(ifaceName).arg(bitrate);
+    QString upCmd   = QString("ip link set up %1").arg(ifaceName);
+
+    // 依次执行：先 down掉 -> 配置波特率 -> 重新 up
+    system(downCmd.toStdString().c_str());
+    system(cfgCmd.toStdString().c_str());
+    system(upCmd.toStdString().c_str());
+
+    qDebug() << "Auto configured CAN interface:" << ifaceName << "at bitrate:" << bitrate;
+#endif
 }
 
 void GpioTestWindow::setupUi()
@@ -76,24 +92,18 @@ void GpioTestWindow::setupUi()
     // ==================== 上半部分：GPIO ====================
     QHBoxLayout *gpioLayout = new QHBoxLayout();
 
-    // --- 左侧：输出 DO ---
     QGridLayout *outLayout = new QGridLayout();
     outLayout->addWidget(new QLabel("输出 (DO)"), 0, 0, 1, 2);
-
     QPushButton* outButtons[] = {
-        btnOut1 = new QPushButton("-"),
-        btnOut2 = new QPushButton("-"),
-        btnOut3 = new QPushButton("-"),
-        btnOut4 = new QPushButton("-")
+        btnOut1 = new QPushButton("-"), btnOut2 = new QPushButton("-"),
+        btnOut3 = new QPushButton("-"), btnOut4 = new QPushButton("-")
     };
-
     QString btnStyle = "QPushButton { background-color: #dcdcdc; border: 1px solid #8f8f91; padding: 4px; }"
                        "QPushButton:pressed { background-color: #a0a0a0; }";
 
     for (int i = 0; i < 4; ++i) {
         QString labelText = QString("OUT%1  (%2)").arg(i + 1).arg(BOARD_DO_PINS[i]);
         outLayout->addWidget(new QLabel(labelText), i + 1, 0);
-
         outButtons[i]->setStyleSheet(btnStyle);
         outButtons[i]->setFixedSize(120, 28);
         outButtons[i]->setProperty("gpio_num", BOARD_DO_PINS[i]);
@@ -101,19 +111,15 @@ void GpioTestWindow::setupUi()
 
         QString initialVal = readGpioValue(BOARD_DO_PINS[i]);
         outButtons[i]->setText(initialVal.isEmpty() ? "1" : initialVal);
-
         outLayout->addWidget(outButtons[i], i + 1, 1);
         connect(outButtons[i], &QPushButton::clicked, this, &GpioTestWindow::onOutButtonClicked);
     }
 
-    // --- 右侧：输入 DI ---
     QGridLayout *inLayout = new QGridLayout();
     inLayout->addWidget(new QLabel("输入 (DI)"), 0, 0, 1, 2);
-
     for (int i = 0; i < 4; ++i) {
         QString labelText = QString("IN%1  (%2)").arg(i + 1).arg(BOARD_DI_PINS[i]);
         inLayout->addWidget(new QLabel(labelText), i + 1, 0);
-
         lblIn[i] = new QLabel("-");
         lblIn[i]->setStyleSheet("background-color: #e0e0e0; padding: 4px; border-radius: 2px;");
         lblIn[i]->setFixedSize(60, 28);
@@ -130,7 +136,7 @@ void GpioTestWindow::setupUi()
     QGridLayout *canLayout = new QGridLayout();
     canLayout->setContentsMargins(0, 30, 0, 10);
 
-    QLabel *canTitle = new QLabel("SocketCAN 通讯测试 (自动探测系统接口)");
+    QLabel *canTitle = new QLabel(QString("SocketCAN 通讯测试 (已自动配置为 %1 bps)").arg(DEFAULT_CAN_BITRATE));
     canTitle->setStyleSheet("font-weight: bold;");
     canLayout->addWidget(canTitle, 0, 0, 1, 3);
 
@@ -141,15 +147,19 @@ void GpioTestWindow::setupUi()
         noCanLabel->setStyleSheet("color: red;");
         canLayout->addWidget(noCanLabel, 1, 0, 1, 3);
     } else {
-        // 根据探测到的 CAN 接口数量，动态生成对应的测试按钮和状态栏
         for (int i = 0; i < availableCans.size(); ++i) {
             QString iface = availableCans.at(i);
+
+            // ==========================================
+            // 核心：在创建UI时，顺便把底层的网卡配置好！
+            // ==========================================
+            autoConfigCanInterface(iface, DEFAULT_CAN_BITRATE);
 
             QLabel *lblIface = new QLabel(iface + " :");
             QPushButton *btnTest = new QPushButton("开始握手测试");
             btnTest->setFixedWidth(120);
 
-            QLabel *lblStatus = new QLabel("准备就绪");
+            QLabel *lblStatus = new QLabel("已配置就绪");
             lblStatus->setFrameStyle(QFrame::Panel | QFrame::Sunken);
             lblStatus->setMinimumWidth(300);
             lblStatus->setStyleSheet("background-color: #f0f0f0; padding: 4px;");
@@ -158,16 +168,13 @@ void GpioTestWindow::setupUi()
             canLayout->addWidget(btnTest, i + 1, 1);
             canLayout->addWidget(lblStatus, i + 1, 2);
 
-            // 将控件信息保存到列表中，方便点击时查找
             CanUiElement element = {iface, btnTest, lblStatus};
             canElements.append(element);
 
-            // 绑定点击事件
             connect(btnTest, &QPushButton::clicked, this, &GpioTestWindow::onCanTestButtonClicked);
         }
     }
 
-    // ==================== 底部：取消按钮 ====================
     QHBoxLayout *bottomLayout = new QHBoxLayout();
     bottomLayout->addStretch();
     QPushButton *btnCancel = new QPushButton("关闭");
@@ -175,44 +182,33 @@ void GpioTestWindow::setupUi()
     bottomLayout->addWidget(btnCancel);
     connect(btnCancel, &QPushButton::clicked, this, &QWidget::close);
 
-    // ==================== 组合所有布局 ====================
     mainLayout->addLayout(gpioLayout);
-
     QFrame *line1 = new QFrame(this);
     line1->setFrameShape(QFrame::HLine);
     line1->setFrameShadow(QFrame::Sunken);
     mainLayout->addWidget(line1);
-
     mainLayout->addLayout(canLayout);
     mainLayout->addStretch();
     mainLayout->addLayout(bottomLayout);
-
     QFrame *line2 = new QFrame(this);
     line2->setFrameShape(QFrame::HLine);
     line2->setFrameShadow(QFrame::Sunken);
     mainLayout->addWidget(line2);
 
-    statusLabel = new QLabel("就绪 (程序已启动)");
+    statusLabel = new QLabel("就绪 (程序已启动，系统网络设备已自动拉起)");
     statusLabel->setFrameStyle(QFrame::Panel | QFrame::Sunken);
     statusLabel->setStyleSheet("padding: 2px; color: #333333;");
     mainLayout->addWidget(statusLabel);
 }
 
-// ==========================================================
-// GPIO 相关功能 (保持不变)
-// ==========================================================
-void GpioTestWindow::showStatus(const QString &msg, bool isError)
-{
-    if (isError) {
-        statusLabel->setStyleSheet("padding: 2px; color: #D32F2F; font-weight: bold;");
-    } else {
-        statusLabel->setStyleSheet("padding: 2px; color: #388E3C;");
-    }
+// （以下函数与上个版本完全一致，为了不占篇幅，保持不变）
+void GpioTestWindow::showStatus(const QString &msg, bool isError) {
+    if (isError) statusLabel->setStyleSheet("padding: 2px; color: #D32F2F; font-weight: bold;");
+    else statusLabel->setStyleSheet("padding: 2px; color: #388E3C;");
     statusLabel->setText(msg);
 }
 
-QString GpioTestWindow::readGpioValue(int gpioNum)
-{
+QString GpioTestWindow::readGpioValue(int gpioNum) {
     QString path = QString("/sys/class/gpio/gpio%1/value").arg(gpioNum);
     QFile file(path);
     if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
@@ -223,8 +219,7 @@ QString GpioTestWindow::readGpioValue(int gpioNum)
     return "";
 }
 
-void GpioTestWindow::writeGpioValue(int gpioNum, const QString &valStr)
-{
+void GpioTestWindow::writeGpioValue(int gpioNum, const QString &valStr) {
     QString path = QString("/sys/class/gpio/gpio%1/value").arg(gpioNum);
     QFile file(path);
     if (file.open(QIODevice::WriteOnly | QIODevice::Text)) {
@@ -236,8 +231,7 @@ void GpioTestWindow::writeGpioValue(int gpioNum, const QString &valStr)
     }
 }
 
-void GpioTestWindow::onOutButtonClicked()
-{
+void GpioTestWindow::onOutButtonClicked() {
     QPushButton *clickedButton = qobject_cast<QPushButton*>(sender());
     if (!clickedButton) return;
     int gpioNum = clickedButton->property("gpio_num").toInt();
@@ -250,26 +244,17 @@ void GpioTestWindow::onOutButtonClicked()
     clickedButton->setText(newText);
 }
 
-void GpioTestWindow::updateInputs()
-{
+void GpioTestWindow::updateInputs() {
     for (int i = 0; i < 4; ++i) {
         QString val = readGpioValue(BOARD_DI_PINS[i]);
         if (!val.isEmpty()) lblIn[i]->setText(val);
     }
 }
 
-// ==========================================================
-// CAN 测试槽函数
-// ==========================================================
-void GpioTestWindow::onCanTestButtonClicked()
-{
+void GpioTestWindow::onCanTestButtonClicked() {
     QPushButton *clickedButton = qobject_cast<QPushButton*>(sender());
     if (!clickedButton) return;
-
-    // 禁用按钮防止重复点击
     clickedButton->setEnabled(false);
-
-    // 找出是被哪个 CAN 接口的按钮点击的
     QString targetIface;
     QLabel *targetStatusLabel = nullptr;
     for (const CanUiElement &element : canElements) {
@@ -279,18 +264,10 @@ void GpioTestWindow::onCanTestButtonClicked()
             break;
         }
     }
-
-    if (targetStatusLabel) {
-        // 调用重写的 SocketCAN 测试核心逻辑
-        performCanHandshake(targetIface, targetStatusLabel);
-    }
-
+    if (targetStatusLabel) performCanHandshake(targetIface, targetStatusLabel);
     clickedButton->setEnabled(true);
 }
 
-// ==========================================================
-// 核心：使用 Linux SocketCAN 重写握手测试逻辑
-// ==========================================================
 void GpioTestWindow::performCanHandshake(const QString &ifaceName, QLabel *statusEdit)
 {
     constexpr uint32_t HANDSHAKE_ID_REQUEST = 0x100;
@@ -302,10 +279,9 @@ void GpioTestWindow::performCanHandshake(const QString &ifaceName, QLabel *statu
 
     statusEdit->setStyleSheet("background-color: yellow; color: black; padding: 4px;");
     statusEdit->setText(QString("正在打开接口 %1...").arg(ifaceName));
-    QCoreApplication::processEvents(); // 刷新UI
+    QCoreApplication::processEvents();
 
 #ifdef Q_OS_LINUX
-    // 1. 创建 RAW Socket
     int sock = socket(PF_CAN, SOCK_RAW, CAN_RAW);
     if (sock < 0) {
         statusEdit->setStyleSheet("background-color: #ffcccc; color: red; padding: 4px;");
@@ -313,7 +289,6 @@ void GpioTestWindow::performCanHandshake(const QString &ifaceName, QLabel *statu
         return;
     }
 
-    // 2. 将 Socket 绑定到指定的 CAN 接口 (例如 can0)
     struct ifreq ifr;
     strcpy(ifr.ifr_name, ifaceName.toStdString().c_str());
     if (ioctl(sock, SIOCGIFINDEX, &ifr) < 0) {
@@ -335,7 +310,6 @@ void GpioTestWindow::performCanHandshake(const QString &ifaceName, QLabel *statu
         return;
     }
 
-    // 3. 将 Socket 设置为非阻塞模式 (为了手动用 elapsedTimer 做精确超时控制，且不卡UI)
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
 
@@ -347,16 +321,13 @@ void GpioTestWindow::performCanHandshake(const QString &ifaceName, QLabel *statu
     QElapsedTimer totalTimer;
     totalTimer.start();
 
-    // 4. 开始 10 轮握手
     for (int round = 1; round <= HANDSHAKE_ROUNDS; ++round)
     {
-        // 填充发送数据，首字节为轮次序号
         txFrame.data[0] = round;
         for(int i = 1; i < DATA_LENGTH; ++i) {
             txFrame.data[i] = 0x10 + i;
         }
 
-        // 发送数据
         if (write(sock, &txFrame, sizeof(struct can_frame)) != sizeof(struct can_frame)) {
             statusEdit->setStyleSheet("background-color: #ffcccc; color: red; padding: 4px;");
             statusEdit->setText(QString("❌ 第%1轮发送失败").arg(round));
@@ -370,7 +341,6 @@ void GpioTestWindow::performCanHandshake(const QString &ifaceName, QLabel *statu
 
         statusEdit->setText(QString("正在进行第 %1 轮握手...").arg(round));
 
-        // 接收数据的超时循环
         while (roundTimer.elapsed() < ROUND_TIMEOUT_MS)
         {
             if (totalTimer.elapsed() >= TOTAL_TIMEOUT_MS) {
@@ -381,11 +351,9 @@ void GpioTestWindow::performCanHandshake(const QString &ifaceName, QLabel *statu
             }
 
             struct can_frame rxFrame;
-            // 非阻塞读取
             int nbytes = read(sock, &rxFrame, sizeof(struct can_frame));
 
             if (nbytes == sizeof(struct can_frame)) {
-                // 判断是否是回复帧且轮次匹配
                 if (rxFrame.can_id == HANDSHAKE_ID_REPLY &&
                     rxFrame.can_dlc == DATA_LENGTH &&
                     rxFrame.data[0] == round)
@@ -394,8 +362,6 @@ void GpioTestWindow::performCanHandshake(const QString &ifaceName, QLabel *statu
                     break;
                 }
             }
-
-            // ★核心：保证在 while 循环中界面不卡死，让用户仍能操作其他按钮
             QCoreApplication::processEvents(QEventLoop::AllEvents, 5);
         }
 
@@ -407,13 +373,11 @@ void GpioTestWindow::performCanHandshake(const QString &ifaceName, QLabel *statu
         }
     }
 
-    // 全部 10 轮成功
     close(sock);
     statusEdit->setStyleSheet("background-color: #ccffcc; color: green; font-weight: bold; padding: 4px;");
     statusEdit->setText("🎉 握手成功！10轮全部完成");
 
 #else
-    // Windows 下仅作 UI 模拟展示 (因为没有真实的 SocketCAN 环境)
     QElapsedTimer dummyTimer;
     dummyTimer.start();
     for (int round = 1; round <= HANDSHAKE_ROUNDS; ++round) {
